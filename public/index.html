@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WhatsApp Automation PoC</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 32px 18px; background: #f3f6f5; color: #18332b; font: 15px/1.5 system-ui, sans-serif; }
+    main { max-width: 880px; margin: auto; }
+    h1 { margin: 0; font-size: 28px; } h2 { margin: 0 0 16px; font-size: 18px; }
+    .muted { color: #60756d; } header { margin-bottom: 24px; }
+    section { background: white; padding: 24px; border: 1px solid #dce5e0; border-radius: 12px; margin: 16px 0; }
+    .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+    .badge { padding: 5px 12px; border-radius: 20px; background: #edf0ef; font-size: 12px; font-weight: 700; }
+    .badge[data-state="CONNECTED"] { color: #09613c; background: #d9f7e9; }
+    .badge[data-state="QR_READY"] { color: #7d5100; background: #fff0c5; }
+    button, input { font: inherit; border-radius: 7px; padding: 10px 14px; }
+    button { border: 0; background: #126d50; color: white; cursor: pointer; }
+    button:disabled { cursor: wait; opacity: .5; } button.secondary { background: #edf2ef; color: #284b3d; }
+    input { display: block; width: 100%; max-width: 360px; border: 1px solid #bccdc3; margin: 6px 0 16px; }
+    #qr { display: block; width: 260px; max-width: 100%; margin: 16px auto; } #qr[hidden] { display: none; }
+    #result { white-space: pre-wrap; min-height: 24px; margin-top: 14px; } .error { color: #ad2c2c; }
+    #logs { height: 330px; overflow: auto; font: 12px/1.6 ui-monospace, monospace; }
+    .entry { padding: 10px 0; border-bottom: 1px solid #e6ede9; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .entry strong { color: #126d50; } .entry time { color: #64796f; }
+  </style>
+</head>
+<body>
+  <main>
+    <header><h1>WhatsApp test bench</h1><div class="muted">Connection, COD confirmation & delivery feedback · Local PoC</div></header>
+    <section>
+      <div class="row"><h2 style="margin:0">1. Connect a SIM</h2><span id="status" class="badge">DISCONNECTED</span></div>
+      <p id="connection" class="muted" aria-live="polite">Waiting for the server…</p>
+      <img id="qr" alt="Scan this QR code using WhatsApp Linked Devices" hidden>
+      <button id="reset" class="secondary">Disconnect / Reset SIM</button>
+    </section>
+    <section>
+      <h2>2. Test a buyer number</h2>
+      <label for="phone">Pakistani mobile number</label>
+      <input id="phone" type="tel" placeholder="03XXXXXXXXX" autocomplete="tel">
+      <div class="row">
+        <button data-action="check" disabled>Check WhatsApp Presence</button>
+        <button data-action="CONFIRM_ORDER" disabled>Send Order Confirmation</button>
+        <button data-action="FEEDBACK" disabled>Send Delivery Feedback</button>
+      </div>
+      <div id="result" role="status" aria-live="polite"></div>
+      <small class="muted">Outgoing tests and automatic replies share a queue with a random 3–5 second gap. This does not guarantee protection from account restrictions.</small>
+    </section>
+    <section>
+      <div class="row"><h2 style="margin:0">3. Live events & replies</h2><span id="queue" class="muted">0 queued</span></div>
+      <p class="muted">Reply YES, NOT ME, NO, 1, 2 or 3 from the receiving phone.</p>
+      <div id="logs" role="log" aria-label="Recent WhatsApp events">No events yet.</div>
+    </section>
+  </main>
+  <script>
+    const $ = id => document.getElementById(id);
+    const actions = [...document.querySelectorAll('[data-action]')];
+    let connected = false;
+    let busy = false;
+    let polling = false;
+    let lastLogId = '';
+    function updateButtons() { actions.forEach(button => { button.disabled = !connected || busy; }); }
+    function result(text, error = false) { $('result').textContent = text; $('result').className = error ? 'error' : ''; }
+    async function post(path, body = {}) {
+      const response = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'Request failed.');
+      return data;
+    }
+    async function poll() {
+      if (polling) return;
+      polling = true;
+      try {
+        const response = await fetch('/api/status', { cache: 'no-store' });
+        if (!response.ok) throw new Error('Status unavailable.');
+        const data = await response.json();
+        connected = data.status === 'CONNECTED' && !data.resetting;
+        $('status').textContent = data.status;
+        $('status').dataset.state = data.status;
+        $('connection').textContent = data.resetting ? 'Clearing session…' : connected ? `Connected: +${data.phone || ''} · ${data.jid}` : data.status === 'QR_READY' ? 'WhatsApp → Settings → Linked Devices → Link a Device. Scan below.' : 'Waiting for connection. If logged out, use Reset SIM to get a fresh QR.';
+        $('qr').hidden = !data.qr;
+        if (data.qr && $('qr').getAttribute('src') !== data.qr) $('qr').src = data.qr;
+        if (!data.qr) $('qr').removeAttribute('src');
+        $('queue').textContent = `${data.queueLength} queued`;
+        const latest = data.logs.at(-1)?.id || '';
+        if (latest !== lastLogId) {
+          lastLogId = latest;
+          const entries = [...data.logs].reverse().map(entry => {
+            const div = document.createElement('div');
+            div.className = 'entry';
+            const time = document.createElement('time');
+            time.textContent = new Date(entry.time).toLocaleTimeString() + '  ';
+            const event = document.createElement('strong');
+            event.textContent = entry.event;
+            const { id, time: timestamp, event: name, ...details } = entry;
+            div.append(time, event, document.createTextNode('\n' + JSON.stringify(details, null, 2)));
+            return div;
+          });
+          $('logs').replaceChildren(...entries);
+        }
+      } catch (error) {
+        connected = false;
+        $('status').textContent = 'SERVER OFFLINE';
+        $('status').dataset.state = 'DISCONNECTED';
+        $('connection').textContent = 'Cannot reach the server. Start it with node server.js.';
+        $('qr').hidden = true;
+      } finally { polling = false; updateButtons(); }
+    }
+    actions.forEach(button => button.addEventListener('click', async () => {
+      busy = true; updateButtons(); result('Working…');
+      try {
+        const phone = $('phone').value;
+        if (button.dataset.action === 'check') {
+          const data = await post('/api/check-number', { phone });
+          result(`+${data.phone}: ${data.exists ? 'WhatsApp account found ✓' : 'No WhatsApp account found'}`);
+        } else {
+          const data = await post('/api/send-test', { phone, type: button.dataset.action });
+          result(`Queued ${data.type} for +${data.phone}. Watch the log for SENT or SEND_FAILED.`);
+        }
+      } catch (error) { result(error.message, true); }
+      finally { busy = false; updateButtons(); void poll(); }
+    }));
+    $('reset').addEventListener('click', async () => {
+      $('reset').disabled = true;
+      connected = false; updateButtons(); result('Resetting session…');
+      try { const data = await post('/api/logout'); result(data.message); }
+      catch (error) { result(error.message, true); }
+      finally { $('reset').disabled = false; void poll(); }
+    });
+    void poll();
+    setInterval(poll, 2000);
+  </script>
+</body>
+</html>

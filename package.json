@@ -1,0 +1,21 @@
+{
+  "name": "whatsapp-automation-poc",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Minimal local WhatsApp automation test dashboard",
+  "scripts": {
+    "start": "node server.js",
+    "check": "node --check server.js"
+  },
+  "engines": { "node": ">=20" },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^7.0.0-rc14",
+    "express": "^5.3.0",
+    "qrcode": "^1.5.4",
+    "pino": "^10.4.0"
+  },
+  "overrides": {
+    "@types/node": "https://registry.npmjs.org/@types/node/-/node-26.6.6.tgz"
+  }
+}
