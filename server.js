@@ -2,13 +2,17 @@ import express from 'express';
 import makeWASocket, { DisconnectReason, fetchLatestBaileysVersion, useMultiFileAuthState } from '@whiskeysockets/baileys';
 import QRCode from 'qrcode';
 import pino from 'pino';
-import { rm } from 'node:fs/promises';
+import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
+import { resolve, join, parse, sep } from 'node:path';
+import { tmpdir } from 'node:os';
 import { randomInt, randomUUID } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 
-// Resolve both public assets and session files relative to this app.
-process.chdir(fileURLToPath(new URL('.', import.meta.url)));
+// Hosting may launch from a different or unavailable working directory.
+const appDir = fileURLToPath(new URL('.', import.meta.url));
+const configuredAuthDir = resolve(appDir, process.env.AUTH_DIR || 'auth_info');
+let authDir;
 const app = express();
 const logger = pino({ level: 'silent' });
 const logs = [];
@@ -45,6 +49,38 @@ function log(event, details = {}) {
   logs.push({ id: randomUUID(), time: new Date().toISOString(), event, ...details });
   if (logs.length > 200) logs.shift();
   console.log(`[${event}]`, details);
+}
+
+async function prepareAuthDirectory() {
+  async function ensureWritable(directory) {
+    // Reset SIM deletes this directory: never allow the app or its parents.
+    if (directory === parse(directory).root || directory === resolve(appDir)
+      || resolve(appDir).startsWith(directory + sep)) {
+      throw new Error('AUTH_DIR must be a dedicated session directory, not the app directory or a filesystem root.');
+    }
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+    const probe = join(directory, `.write-test-${randomUUID()}`);
+    await writeFile(probe, '', { flag: 'wx', mode: 0o600 });
+    await rm(probe, { force: true });
+    return directory;
+  }
+
+  if (authDir) return ensureWritable(authDir);
+  try {
+    authDir = await ensureWritable(configuredAuthDir);
+  } catch (error) {
+    // An explicit persistent path must work; silently replacing it loses sessions.
+    if (process.env.AUTH_DIR || !['ENOENT', 'EROFS', 'EACCES', 'EPERM'].includes(error.code)) {
+      throw new Error(`Cannot create WhatsApp session directory ${configuredAuthDir}: ${error.message}. Set AUTH_DIR to a dedicated writable directory.`, { cause: error });
+    }
+    authDir = await ensureWritable(join(tmpdir(), 'whatsapp-automation-poc', 'auth_info'));
+    log('AUTH_STORAGE_TEMPORARY', {
+      reason: error.code,
+      message: 'App directory is unavailable or not writable. Using temporary storage; set AUTH_DIR to a persistent writable directory to retain the linked session.',
+    });
+  }
+  log('AUTH_STORAGE_READY', { directory: authDir });
+  return authDir;
 }
 
 function normalizePhone(value) {
@@ -116,7 +152,8 @@ async function connect() {
   starting = (async () => {
     const token = ++generation;
     try {
-      const { state, saveCreds } = await useMultiFileAuthState('./auth_info');
+      const directory = await prepareAuthDirectory();
+      const { state, saveCreds } = await useMultiFileAuthState(directory);
       const { version } = await fetchLatestBaileysVersion();
       if (token !== generation || resetting || stopping) return;
       const current = makeWASocket({ auth: state, version, logger, markOnlineOnConnect: false, syncFullHistory: false });
@@ -237,7 +274,7 @@ app.post('/api/logout', async (_req, res) => {
       finally { previous.end(new Error('Session reset')); }
     }
     await credentialWrites;
-    await rm('./auth_info', { recursive: true, force: true });
+    if (authDir) await rm(authDir, { recursive: true, force: true });
     log('SESSION_RESET', { cancelled });
   } finally {
     resetting = false;
@@ -252,8 +289,10 @@ app.use((error, _req, res, _next) => {
   res.status(code).json({ error: error.message });
 });
 
-const server = app.listen(4000, '127.0.0.1', () => {
-  console.log('WhatsApp PoC: http://localhost:4000');
+const port = Number(process.env.PORT || 4000);
+const host = process.env.HOST || (process.env.PORT ? '0.0.0.0' : '127.0.0.1');
+const server = app.listen(port, host, () => {
+  console.log(`WhatsApp PoC listening on ${host}:${port}`);
   void connect();
 });
 server.on('error', error => { console.error(error.message); process.exitCode = 1; });
